@@ -219,9 +219,15 @@ def build_analysis_df(merged: pd.DataFrame, data: dict) -> pd.DataFrame:
         df["bb_peak"] = df["date"].apply(
             lambda d: bb_peak.get(d.isoformat()) if isinstance(d, datetime.date) else None
         )
-        df["bb_drop"] = df["date"].apply(
-            lambda d: (bb_peak.get(d.isoformat()) - bb_min.get(d.isoformat())) if isinstance(d, datetime.date) else None,
-        )
+        def compute_bb_drop(d):
+            if not isinstance(d, datetime.date):
+                return None
+            pk = bb_peak.get(d.isoformat())
+            mn = bb_min.get(d.isoformat())
+            if pk is not None and mn is not None:
+                return pk - mn
+            return None
+        df["bb_drop"] = df["date"].apply(compute_bb_drop)
 
     return df
 
