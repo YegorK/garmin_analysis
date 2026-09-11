@@ -29,9 +29,23 @@ import time
 from pathlib import Path
 
 try:
+    import garmin_common as gc
+    from garmin_common import (
+        OUTPUT_DIR, DB_PATH, INSTALL_HINT,
+        SLEEP_COLORS, STEPS_COLOR, STRESS_COLOR, HRV_COLOR,
+        HR_COLOR, SPO2_COLOR, RESP_COLOR, BB_COLOR,
+    )
+except ImportError:
+    print("ERROR: garmin_common.py not found.")
+    print("       It must sit in the same folder as this script — copy it across")
+    print("       together with the analysis scripts.")
+    sys.exit(1)
+
+try:
     import garminconnect
 except ImportError:
-    print("ERROR: garminconnect not installed. Run: pip install garminconnect")
+    print("ERROR: missing library 'garminconnect'.")
+    print(INSTALL_HINT)
     sys.exit(1)
 
 try:
@@ -39,34 +53,22 @@ try:
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     import numpy as np
-except ImportError:
-    print("ERROR: Missing libraries. Run: pip install pandas matplotlib numpy")
+except ImportError as e:
+    print(f"ERROR: missing library '{e.name or 'unknown'}'.")
+    print(INSTALL_HINT)
     sys.exit(1)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 START_DATE          = datetime.date(2026, 1, 1)
 END_DATE            = datetime.date.today()
-OUTPUT_DIR          = Path("garmin_output")
-DB_PATH             = OUTPUT_DIR / "garmin.db"
 INTRADAY_CHART_DAYS = 7   # how many recent days to show in the intraday chart
 REFETCH_TAIL_DAYS   = 2   # always re-pull the most recent N days (might be partial)
-OUTPUT_DIR.mkdir(exist_ok=True)
 
 # All "sources" we track per day in fetch_log
 DAILY_SOURCES    = ["sleep", "stats", "hrv"]
 INTRADAY_SOURCES = ["heart_rate", "steps", "stress", "spo2", "respiration", "body_battery"]
 ALL_SOURCES      = DAILY_SOURCES + INTRADAY_SOURCES
-
-# Chart palette
-SLEEP_COLORS = {"deep": "#1a3a5c", "light": "#5b9bd5", "rem": "#8a63d2", "awake": "#e8a838"}
-STEPS_COLOR  = "#3498db"
-STRESS_COLOR = "#e74c3c"
-HRV_COLOR    = "#9b59b6"
-HR_COLOR     = "#ff6b6b"
-SPO2_COLOR   = "#4fc3f7"
-RESP_COLOR   = "#ef9a9a"
-BB_COLOR     = "#2ecc71"
 
 
 # ── DB layer ──────────────────────────────────────────────────────────────────
@@ -129,11 +131,8 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 
 
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous  = NORMAL")
-    conn.executescript(SCHEMA)
-    return conn
+    """Open the DB, creating it and its tables if this is a first run."""
+    return gc.connect_db(require_exists=False, schema=SCHEMA)
 
 
 def get_completed_dates(conn) -> dict[str, set[str]]:
@@ -303,7 +302,7 @@ def fetch_hrv(client, conn, ds: str) -> int:
         sv = h["hrvSummary"]
         conn.execute(
             "INSERT OR REPLACE INTO hrv VALUES (?,?,?,?,?)",
-            (ds, sv.get("weeklyAvg"), sv.get("lastNight"), sv.get("status"), now_iso()),
+            (ds, sv.get("weeklyAvg"), sv.get("lastNightAvg"), sv.get("status"), now_iso()),
         )
         return 1
     return 0
@@ -549,37 +548,11 @@ def load_dataframes(conn) -> tuple[dict, dict]:
 
 
 # ── Matplotlib theme ──────────────────────────────────────────────────────────
-plt.rcParams.update({
-    "font.family":       "DejaVu Sans",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "axes.grid":         True,
-    "grid.alpha":        0.25,
-    "figure.facecolor":  "#0f1117",
-    "axes.facecolor":    "#171b26",
-    "axes.labelcolor":   "#c8cdd8",
-    "xtick.color":       "#c8cdd8",
-    "ytick.color":       "#c8cdd8",
-    "text.color":        "#e8ecf4",
-    "grid.color":        "#2a2f3e",
-})
+gc.apply_theme()
 
 
 def _rolling(s, w=7):
     return s.rolling(w, min_periods=1).mean()
-
-
-def _save(fig, name):
-    p = OUTPUT_DIR / name
-    fig.savefig(p, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    print(f"  → {p}")
-    plt.close(fig)
-
-
-def _fmt_date(ax):
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
 
 
 # ── Daily charts ──────────────────────────────────────────────────────────────
@@ -596,7 +569,7 @@ def chart_sleep(df):
     ax.bar(df["date"], df["awake_h"], label="Awake", color=SLEEP_COLORS["awake"], width=0.8, bottom=df["deep_h"]+df["rem_h"]+df["light_h"])
     ax.plot(df["date"], _rolling(df["duration_h"]), color="white", lw=1.5, label="7d avg", zorder=5)
     ax.set_ylabel("Hours"); ax.set_title("Sleep Duration & Stages", fontsize=12)
-    ax.legend(loc="upper right", framealpha=0.2, fontsize=8); _fmt_date(ax)
+    ax.legend(loc="upper right", framealpha=0.2, fontsize=8); gc.fmt_date_axis(ax)
 
     ax2 = axes[1]
     sd = df.dropna(subset=["score"])
@@ -605,7 +578,7 @@ def chart_sleep(df):
         ax2.plot(sd["date"], _rolling(sd["score"]), color="#f0c040", lw=1.5, label="7d avg")
         ax2.set_ylim(0, 100); ax2.axhline(70, color="#aaa", ls="--", lw=0.8, alpha=0.5)
         ax2.set_ylabel("Score"); ax2.set_title("Sleep Score", fontsize=12)
-        ax2.legend(framealpha=0.2, fontsize=8); _fmt_date(ax2)
+        ax2.legend(framealpha=0.2, fontsize=8); gc.fmt_date_axis(ax2)
 
     ax3 = axes[2]
     s2 = df.dropna(subset=["avg_spo2"])
@@ -618,9 +591,9 @@ def chart_sleep(df):
         ax3b.plot(r2["date"], r2["avg_respiration"], color=RESP_COLOR, lw=1.2)
         ax3b.set_ylabel("Breaths/min", color=RESP_COLOR); ax3b.tick_params(colors=RESP_COLOR)
         ax3b.spines["right"].set_visible(True); ax3b.spines["right"].set_color("#2a2f3e")
-    ax3.set_title("SpO₂ & Respiration Rate", fontsize=12); _fmt_date(ax3)
+    ax3.set_title("SpO₂ & Respiration Rate", fontsize=12); gc.fmt_date_axis(ax3)
 
-    fig.tight_layout(); _save(fig, "sleep_analysis.png")
+    fig.tight_layout(); gc.save_fig(fig, "sleep_analysis.png")
 
 
 def chart_activity(df_daily, df_acts):
@@ -634,7 +607,7 @@ def chart_activity(df_daily, df_acts):
     ax.plot(df_daily["date"], _rolling(df_daily["steps"]), color="white", lw=1.5, label="7d avg")
     ax.axhline(10000, color="#f0c040", ls="--", lw=0.8, alpha=0.7, label="10k goal")
     ax.set_ylabel("Steps"); ax.set_title("Daily Steps", fontsize=12)
-    ax.legend(framealpha=0.2, fontsize=8); _fmt_date(ax)
+    ax.legend(framealpha=0.2, fontsize=8); gc.fmt_date_axis(ax)
 
     ax2 = axes[1]
     sd = df_daily.dropna(subset=["stress_avg"])
@@ -648,7 +621,7 @@ def chart_activity(df_daily, df_acts):
         ax2b.plot(rd["date"], rd["rhr"], color="#80deea", lw=1.5, marker="o", ms=2, label="RHR (bpm)")
         ax2b.set_ylabel("RHR (bpm)", color="#80deea"); ax2b.tick_params(colors="#80deea")
         ax2b.spines["right"].set_visible(True); ax2b.spines["right"].set_color("#2a2f3e")
-    ax2.set_title("Stress & Resting Heart Rate", fontsize=12); _fmt_date(ax2)
+    ax2.set_title("Stress & Resting Heart Rate", fontsize=12); gc.fmt_date_axis(ax2)
 
     ax3 = axes[2]
     if not df_acts.empty:
@@ -660,7 +633,7 @@ def chart_activity(df_daily, df_acts):
     else:
         ax3.text(0.5, 0.5, "No activity data", ha="center", va="center", transform=ax3.transAxes)
 
-    fig.tight_layout(); _save(fig, "activity_analysis.png")
+    fig.tight_layout(); gc.save_fig(fig, "activity_analysis.png")
 
 
 def chart_hrv(df):
@@ -674,8 +647,8 @@ def chart_hrv(df):
         ax.bar(ln["date"], ln["last_night"], color=HRV_COLOR, alpha=0.5, width=0.8, label="Last Night")
     if not wa.empty:
         ax.plot(wa["date"], wa["weekly_avg"], color="white", lw=2, label="Weekly Avg")
-    ax.set_ylabel("HRV (ms)"); ax.legend(framealpha=0.2); _fmt_date(ax)
-    fig.tight_layout(); _save(fig, "hrv_analysis.png")
+    ax.set_ylabel("HRV (ms)"); ax.legend(framealpha=0.2); gc.fmt_date_axis(ax)
+    fig.tight_layout(); gc.save_fig(fig, "hrv_analysis.png")
 
 
 # ── Intraday chart ────────────────────────────────────────────────────────────
@@ -747,7 +720,7 @@ def chart_intraday(intra: dict):
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha="center", fontsize=8)
 
     fig.tight_layout()
-    _save(fig, "intraday_sample.png")
+    gc.save_fig(fig, "intraday_sample.png")
 
 
 # ── Status report ─────────────────────────────────────────────────────────────
@@ -763,11 +736,7 @@ def show_status(conn):
 
     print("\nDaily aggregates:")
     for tbl in ["sleep", "daily", "hrv", "activities"]:
-        rng = conn.execute(
-            f"SELECT MIN(date), MAX(date) FROM {tbl}"
-        ).fetchone() if tbl != "activities" else conn.execute(
-            "SELECT MIN(date), MAX(date) FROM activities"
-        ).fetchone()
+        rng = conn.execute(f"SELECT MIN(date), MAX(date) FROM {tbl}").fetchone()
         rng_str = f"{rng[0]} → {rng[1]}" if rng[0] else "—"
         print(f"  {tbl:<14} {counts[tbl]:>6,} rows   {rng_str}")
 

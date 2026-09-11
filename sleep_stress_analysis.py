@@ -12,96 +12,78 @@ Usage:
 
 import argparse
 import datetime
-import sqlite3
 import sys
-from pathlib import Path
-from collections import defaultdict
+from typing import NamedTuple
+
+try:
+    import garmin_common as gc
+    from garmin_common import (
+        OUTPUT_DIR, DB_PATH, INSTALL_HINT,
+        SLEEP_SCORE_COLOR, STRESS_COLOR, HRV_COLOR, BB_COLOR,
+    )
+except ImportError:
+    print("ERROR: garmin_common.py not found.")
+    print("       It must sit in the same folder as this script — copy it across")
+    print("       together with the analysis scripts.")
+    sys.exit(1)
 
 try:
     import pandas as pd
     import numpy as np
     import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
     from scipy.stats import pearsonr, f_oneway
-except ImportError:
-    print("ERROR: Missing libraries. Run: pip install pandas numpy matplotlib scipy")
+except ImportError as e:
+    print(f"ERROR: missing library '{e.name or 'unknown'}'.")
+    print(INSTALL_HINT)
     sys.exit(1)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_PATH = Path("garmin_output") / "garmin.db"
-OUTPUT_DIR = Path("garmin_output")
 REPORT_PATH = OUTPUT_DIR / "sleep_stress_report.txt"
 
 # Intraday coverage thresholds
 INTRADAY_COVERAGE_MIN = 0.70  # 70% of expected data points required
 
-# Colors
-SLEEP_SCORE_COLOR = "#5b9bd5"
-STRESS_COLOR = "#e74c3c"
-HRV_COLOR = "#9b59b6"
-BB_COLOR = "#2ecc71"
-
-# Plot theme
-plt.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "axes.grid": True,
-    "grid.alpha": 0.25,
-    "figure.facecolor": "#0f1117",
-    "axes.facecolor": "#171b26",
-    "axes.labelcolor": "#c8cdd8",
-    "xtick.color": "#c8cdd8",
-    "ytick.color": "#c8cdd8",
-    "text.color": "#e8ecf4",
-    "grid.color": "#2a2f3e",
-})
+gc.apply_theme()
 
 
-def db_connect() -> sqlite3.Connection:
-    if not DB_PATH.exists():
-        print(f"ERROR: Database not found at {DB_PATH}")
-        sys.exit(1)
-    return sqlite3.connect(DB_PATH)
+def load_raw_data(conn, days_limit: int = None) -> dict:
+    """Load all tables from DB, keyed by name."""
+    frames = {
+        "daily": pd.read_sql("SELECT * FROM daily ORDER BY date", conn),
+        "sleep": pd.read_sql("SELECT * FROM sleep ORDER BY date", conn),
+        "hrv":   pd.read_sql("SELECT * FROM hrv   ORDER BY date", conn),
+        "stress_intra": pd.read_sql("SELECT timestamp, date, stress FROM stress ORDER BY timestamp", conn),
+        "bb_intra":     pd.read_sql("SELECT timestamp, date, body_battery FROM body_battery ORDER BY timestamp", conn),
+        "hr_intra":     pd.read_sql("SELECT timestamp, date, heart_rate FROM heart_rate ORDER BY timestamp", conn),
+    }
 
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days_limit)) if days_limit else None
 
-def load_raw_data(conn, days_limit: int = None) -> tuple[dict, list]:
-    """Load all tables from DB. Return (dataframes_dict, excluded_dates)."""
-    excluded = []
+    # Daily aggregates: parse date, then apply the window.
+    for key in ("daily", "sleep", "hrv"):
+        df = frames[key]
+        if df.empty or "date" not in df.columns:
+            continue
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        if cutoff:
+            df = df[df["date"] >= cutoff]
+        frames[key] = df
 
-    # Load daily aggregates
-    daily = pd.read_sql("SELECT * FROM daily ORDER BY date", conn)
-    sleep = pd.read_sql("SELECT * FROM sleep ORDER BY date", conn)
-    hrv = pd.read_sql("SELECT * FROM hrv ORDER BY date", conn)
+    # Intraday: parse timestamp, drop unparseable rows, then apply the window.
+    # Results must be written back into `frames` — rebinding the loop variable
+    # silently discards both the dropna and the cutoff.
+    for key in ("stress_intra", "bb_intra", "hr_intra"):
+        df = frames[key]
+        if df.empty:
+            continue
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        if cutoff:
+            df = df[df["date"] >= cutoff.isoformat()]
+        frames[key] = df
 
-    # Load intraday timeseries
-    stress_intra = pd.read_sql("SELECT timestamp, date, stress FROM stress ORDER BY timestamp", conn)
-    bb_intra = pd.read_sql("SELECT timestamp, date, body_battery FROM body_battery ORDER BY timestamp", conn)
-    hr_intra = pd.read_sql("SELECT timestamp, date, heart_rate FROM heart_rate ORDER BY timestamp", conn)
-
-    # Convert timestamps
-    for df in [stress_intra, bb_intra, hr_intra]:
-        if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            df = df.dropna(subset=["timestamp"])
-
-    # Convert dates
-    for df in [daily, sleep, hrv]:
-        if not df.empty and "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"]).dt.date
-
-    # Apply days limit if requested
-    if days_limit:
-        cutoff = datetime.date.today() - datetime.timedelta(days=days_limit)
-        daily = daily[daily["date"] >= cutoff] if not daily.empty else daily
-        sleep = sleep[sleep["date"] >= cutoff] if not sleep.empty else sleep
-        hrv = hrv[hrv["date"] >= cutoff] if not hrv.empty else hrv
-        for df in [stress_intra, bb_intra, hr_intra]:
-            if not df.empty:
-                df = df[df["date"] >= cutoff.isoformat()]
-
-    return {"daily": daily, "sleep": sleep, "hrv": hrv, "stress_intra": stress_intra, "bb_intra": bb_intra, "hr_intra": hr_intra}, excluded
+    return frames
 
 
 def filter_incomplete_days(data: dict) -> tuple[pd.DataFrame, list]:
@@ -160,7 +142,9 @@ def filter_incomplete_days(data: dict) -> tuple[pd.DataFrame, list]:
     # Filter to only days with good intraday coverage (for stress/HRV analysis)
     if covered_dates:
         # Keep all days for daily aggregates, but mark which have good intraday data
-        merged["has_intraday_data"] = merged["date"].isin(covered_dates)
+        # covered_dates holds ISO strings (the intraday tables store date as
+        # TEXT); merged["date"] holds datetime.date. Compare like for like.
+        merged["has_intraday_data"] = merged["date"].astype(str).isin(covered_dates)
     else:
         merged["has_intraday_data"] = True
 
@@ -219,17 +203,32 @@ def build_analysis_df(merged: pd.DataFrame, data: dict) -> pd.DataFrame:
         df["bb_peak"] = df["date"].apply(
             lambda d: bb_peak.get(d.isoformat()) if isinstance(d, datetime.date) else None
         )
-        df["bb_drop"] = df["date"].apply(
-            lambda d: (bb_peak.get(d.isoformat()) - bb_min.get(d.isoformat())) if isinstance(d, datetime.date) else None,
-        )
+        def compute_bb_drop(d):
+            if not isinstance(d, datetime.date):
+                return None
+            pk = bb_peak.get(d.isoformat())
+            mn = bb_min.get(d.isoformat())
+            if pk is not None and mn is not None:
+                return pk - mn
+            return None
+        df["bb_drop"] = df["date"].apply(compute_bb_drop)
 
     return df
+
+
+class Corr(NamedTuple):
+    """One correlation result. Keeps the source columns so charts can re-plot it."""
+    r: float
+    p: float
+    n: int
+    col1: str
+    col2: str
 
 
 def compute_correlations(df: pd.DataFrame) -> dict:
     """
     Compute all key correlations.
-    Return {name: (r, p, n)} tuples.
+    Return {label: Corr}.
     """
     corrs = {}
 
@@ -250,7 +249,7 @@ def compute_correlations(df: pd.DataFrame) -> dict:
             subset = df[[col1, col2]].dropna()
             if len(subset) >= 3:
                 r, p = pearsonr(subset[col1], subset[col2])
-                corrs[label] = (r, p, len(subset))
+                corrs[label] = Corr(r, p, len(subset), col1, col2)
 
     return corrs
 
@@ -284,7 +283,7 @@ def compute_weekly_patterns(df: pd.DataFrame) -> dict:
     return results
 
 
-def detect_interesting_days(df: pd.DataFrame, corrs: dict) -> list:
+def detect_interesting_days(df: pd.DataFrame) -> list:
     """
     Detect and annotate interesting days.
     Return list of {date, category, reasoning} dicts.
@@ -294,64 +293,75 @@ def detect_interesting_days(df: pd.DataFrame, corrs: dict) -> list:
     # Z-score threshold
     z_thresh = 1.5
 
-    # Standardize key metrics
-    for col in ["score", "stress_avg", "last_night", "duration_h"]:
+    # Standardize key metrics. Work on a copy so the caller's frame doesn't
+    # sprout _z columns as a side effect.
+    df = df.copy()
+    for col in ["score", "stress_avg", "last_night", "duration_h", "stress_prev", "stress_next"]:
         if col in df.columns and df[col].notna().sum() > 0:
             df[f"{col}_z"] = (df[col] - df[col].mean()) / (df[col].std() + 1e-6)
 
+    def has(*cols) -> bool:
+        """A metric that was entirely NULL gets no _z column — skip those patterns."""
+        return all(c in df.columns for c in cols)
+
     # Pattern: worst cascade (3-day stress-sleep loop)
-    for i in range(1, len(df) - 1):
-        if (
-            df.iloc[i - 1]["stress_avg_z"] > z_thresh
-            and df.iloc[i]["score_z"] < -z_thresh
-            and df.iloc[i + 1]["stress_avg_z"] > z_thresh
-        ):
-            interesting.append({
-                "date": df.iloc[i]["date"],
-                "category": "Worst Cascade",
-                "reasoning": f"High stress ({df.iloc[i-1]['stress_avg']:.0f}) → poor sleep score ({df.iloc[i]['score']:.0f}) → high stress again ({df.iloc[i+1]['stress_avg']:.0f}). Classic feedback loop.",
-            })
+    if has("stress_avg_z", "score_z"):
+        for i in range(1, len(df) - 1):
+            if (
+                df.iloc[i - 1]["stress_avg_z"] > z_thresh
+                and df.iloc[i]["score_z"] < -z_thresh
+                and df.iloc[i + 1]["stress_avg_z"] > z_thresh
+            ):
+                interesting.append({
+                    "date": df.iloc[i]["date"],
+                    "category": "Worst Cascade",
+                    "reasoning": f"High stress ({df.iloc[i-1]['stress_avg']:.0f}) → poor sleep score ({df.iloc[i]['score']:.0f}) → high stress again ({df.iloc[i+1]['stress_avg']:.0f}). Classic feedback loop.",
+                })
 
     # Pattern: best recovery (high sleep score + low next-day stress + high HRV)
-    recovery = df[
-        (df["score_z"] > z_thresh)
-        & (df["stress_next_z"] if "stress_next_z" in df.columns else False)
-        & (df["last_night_z"] > z_thresh if "last_night_z" in df.columns else False)
-    ]
-    for _, row in recovery.iterrows():
-        interesting.append({
-            "date": row["date"],
-            "category": "Best Recovery",
-            "reasoning": f"Excellent sleep score ({row['score']:.0f}), HRV high ({row['last_night']:.0f}ms), and stress low the next day. Ideal recovery day.",
-        })
+    if has("score_z", "stress_next_z", "last_night_z"):
+        recovery = df[
+            (df["score_z"] > z_thresh)
+            & (df["stress_next_z"] < -z_thresh)
+            & (df["last_night_z"] > z_thresh)
+        ]
+        for _, row in recovery.iterrows():
+            interesting.append({
+                "date": row["date"],
+                "category": "Best Recovery",
+                "reasoning": f"Excellent sleep score ({row['score']:.0f}), HRV high ({row['last_night']:.0f}ms), and stress low the next day. Ideal recovery day.",
+            })
 
     # Pattern: stress spike didn't hurt sleep (resilience)
-    resilience = df[
-        (df["stress_avg_z"] > z_thresh)
-        & (df["score_z"] > -z_thresh)
-        & (df["score"].notna())
-    ]
-    for _, row in resilience.iterrows():
-        interesting.append({
-            "date": row["date"],
-            "category": "Stress Resilience",
-            "reasoning": f"High stress ({row['stress_avg']:.0f}) but sleep score was still decent ({row['score']:.0f}). Shows good stress coping.",
-        })
+    if has("stress_avg_z", "score_z"):
+        resilience = df[
+            (df["stress_avg_z"] > z_thresh)
+            & (df["score_z"] > -z_thresh)
+            & (df["score"].notna())
+        ]
+        for _, row in resilience.iterrows():
+            interesting.append({
+                "date": row["date"],
+                "category": "Stress Resilience",
+                "reasoning": f"High stress ({row['stress_avg']:.0f}) but sleep score was still decent ({row['score']:.0f}). Shows good stress coping.",
+            })
 
-    # Pattern: surprise bad night (no prior stress but poor sleep)
-    bad_surprise = df[
-        (df["stress_prev_z"] > -z_thresh if "stress_prev_z" in df.columns else False)
-        & (df["score_z"] < -z_thresh)
-    ]
-    for _, row in bad_surprise.iterrows():
-        reasoning = f"Poor sleep score ({row['score']:.0f}) despite no elevated stress the day before. Other factors may have contributed."
-        if row["evening_stress"] and not pd.isna(row["evening_stress"]):
-            reasoning += f" (evening stress was {row['evening_stress']:.0f})"
-        interesting.append({
-            "date": row["date"],
-            "category": "Surprise Bad Night",
-            "reasoning": reasoning,
-        })
+    # Pattern: surprise bad night (poor sleep with no elevated stress the day before)
+    if has("stress_prev_z", "score_z"):
+        bad_surprise = df[
+            (df["stress_prev_z"] < z_thresh)
+            & (df["score_z"] < -z_thresh)
+        ]
+        for _, row in bad_surprise.iterrows():
+            reasoning = f"Poor sleep score ({row['score']:.0f}) despite no elevated stress the day before. Other factors may have contributed."
+            evening = row.get("evening_stress")
+            if evening is not None and not pd.isna(evening):
+                reasoning += f" (evening stress was {evening:.0f})"
+            interesting.append({
+                "date": row["date"],
+                "category": "Surprise Bad Night",
+                "reasoning": reasoning,
+            })
 
     # Pattern: high-stress cluster (3+ consecutive days > stress 60th percentile)
     if "stress_avg" in df.columns:
@@ -397,17 +407,17 @@ def save_report(df: pd.DataFrame, corrs: dict, dow_patterns: dict, interesting: 
         # Correlations
         f.write(f"Key Correlations (Pearson r, p-value)\n")
         f.write(f"-------------------------------------\n")
-        for label, (r, p, n) in sorted(corrs.items(), key=lambda x: abs(x[1][0]), reverse=True):
-            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "  "
-            f.write(f"  {label:<45} r={r:+.3f}  p={p:.4f} {sig}  (n={n})\n")
+        for label, c in sorted(corrs.items(), key=lambda x: abs(x[1].r), reverse=True):
+            sig = "***" if c.p < 0.001 else "**" if c.p < 0.01 else "*" if c.p < 0.05 else "  "
+            f.write(f"  {label:<45} r={c.r:+.3f}  p={c.p:.4f} {sig}  (n={c.n})\n")
         f.write("\n")
 
         # Strongest effect
         if corrs:
-            strongest = max(corrs.items(), key=lambda x: abs(x[1][0]))
+            label, c = max(corrs.items(), key=lambda x: abs(x[1].r))
             f.write(f"Strongest Effect\n")
             f.write(f"----------------\n")
-            f.write(f"  {strongest[0]}: r={strongest[1][0]:+.3f}, p={strongest[1][1]:.4f}\n\n")
+            f.write(f"  {label}: r={c.r:+.3f}, p={c.p:.4f}\n\n")
 
         # Weekly patterns
         if dow_patterns:
@@ -446,53 +456,36 @@ def save_report(df: pd.DataFrame, corrs: dict, dow_patterns: dict, interesting: 
     print(f"✓ Report saved to {REPORT_PATH}\n")
 
 
-def _fmt_date(ax):
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
-
-
-def _save(fig, name):
-    p = OUTPUT_DIR / name
-    fig.savefig(p, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    print(f"  → {p}")
-    plt.close(fig)
-
-
 def chart_corr_scatter_grid(df: pd.DataFrame, corrs: dict):
     """3×3 scatter plot grid for top correlations."""
-    pairs = sorted(corrs.items(), key=lambda x: abs(x[1][0]), reverse=True)[:9]
+    pairs = sorted(corrs.items(), key=lambda x: abs(x[1].r), reverse=True)[:9]
     if not pairs:
         return
 
     fig, axes = plt.subplots(3, 3, figsize=(14, 12), facecolor="#0f1117")
     axes = axes.flatten()
 
-    for idx, (label, (r, p, n)) in enumerate(pairs):
+    for idx, (label, c) in enumerate(pairs):
         ax = axes[idx]
-        col1, col2 = label.split(" → ")
-        col1, col2 = col1.strip(), col2.strip()
-
-        if col1 in df.columns and col2 in df.columns:
-            subset = df[[col1, col2]].dropna()
-            if len(subset) > 1:
-                x, y = subset[col1], subset[col2]
-                ax.scatter(x, y, alpha=0.5, s=30, color=SLEEP_SCORE_COLOR)
-                # Regression line
-                z = np.polyfit(x, y, 1)
-                p_line = np.poly1d(z)
-                x_line = np.linspace(x.min(), x.max(), 50)
-                ax.plot(x_line, p_line(x_line), color="white", lw=1.5, alpha=0.7)
-                ax.set_title(f"r={r:+.2f}, p={p:.3f}", fontsize=9)
-                ax.set_xlabel(col1, fontsize=8)
-                ax.set_ylabel(col2, fontsize=8)
+        subset = df[[c.col1, c.col2]].dropna()
+        if len(subset) > 1:
+            x, y = subset[c.col1], subset[c.col2]
+            ax.scatter(x, y, alpha=0.5, s=30, color=SLEEP_SCORE_COLOR)
+            # Regression line
+            z = np.polyfit(x, y, 1)
+            p_line = np.poly1d(z)
+            x_line = np.linspace(x.min(), x.max(), 50)
+            ax.plot(x_line, p_line(x_line), color="white", lw=1.5, alpha=0.7)
+            ax.set_title(f"{label}\nr={c.r:+.2f}, p={c.p:.3f}  (n={c.n})", fontsize=8)
+            ax.set_xlabel(c.col1, fontsize=8)
+            ax.set_ylabel(c.col2, fontsize=8)
 
     for idx in range(len(pairs), 9):
         axes[idx].axis("off")
 
     fig.suptitle("Top Correlations — Sleep & Stress", fontsize=14, fontweight="bold", y=0.995)
     fig.tight_layout()
-    _save(fig, "corr_scatter_grid.png")
+    gc.save_fig(fig, "corr_scatter_grid.png")
 
 
 def chart_corr_heatmap(df: pd.DataFrame):
@@ -526,7 +519,7 @@ def chart_corr_heatmap(df: pd.DataFrame):
     plt.colorbar(im, ax=ax, label="Correlation (r)")
     fig.suptitle("Correlation Heatmap", fontsize=14, fontweight="bold")
     fig.tight_layout()
-    _save(fig, "corr_heatmap.png")
+    gc.save_fig(fig, "corr_heatmap.png")
 
 
 def chart_corr_timeseries(df: pd.DataFrame):
@@ -546,7 +539,7 @@ def chart_corr_timeseries(df: pd.DataFrame):
     ax1.tick_params(axis="y", labelcolor=SLEEP_SCORE_COLOR)
     ax1b.tick_params(axis="y", labelcolor=STRESS_COLOR)
     ax1.set_title("Sleep Score vs Next-Day Stress", fontsize=12)
-    _fmt_date(ax1)
+    gc.fmt_date_axis(ax1)
 
     # Rolling correlation
     rolling_corr = df_plot.set_index("date")[["score", "stress_next"]].rolling(7).corr().unstack()
@@ -556,10 +549,10 @@ def chart_corr_timeseries(df: pd.DataFrame):
     ax2.fill_between(rolling_corr.index, rolling_corr.values, 0, alpha=0.3, color="white")
     ax2.set_ylabel("7-day Rolling Corr")
     ax2.set_ylim(-1, 1)
-    _fmt_date(ax2)
+    gc.fmt_date_axis(ax2)
 
     fig.tight_layout()
-    _save(fig, "corr_timeseries_overlay.png")
+    gc.save_fig(fig, "corr_timeseries_overlay.png")
 
 
 def chart_stress_profile(df: pd.DataFrame, data: dict):
@@ -590,7 +583,7 @@ def chart_stress_profile(df: pd.DataFrame, data: dict):
     ax.grid(True, alpha=0.3)
     fig.suptitle("Intraday Stress Profile: Good vs Poor Sleep Nights", fontsize=12, fontweight="bold")
     fig.tight_layout()
-    _save(fig, "corr_stress_profile.png")
+    gc.save_fig(fig, "corr_stress_profile.png")
 
 
 def chart_recovery(df: pd.DataFrame):
@@ -607,7 +600,7 @@ def chart_recovery(df: pd.DataFrame):
     ax.set_title("Sleep Quality → Recovery Capacity (colored by stress)", fontsize=12)
     cbar = plt.colorbar(scatter, ax=ax, label="Daily Stress")
     fig.tight_layout()
-    _save(fig, "corr_recovery.png")
+    gc.save_fig(fig, "corr_recovery.png")
 
 
 def chart_weekly(df: pd.DataFrame):
@@ -638,7 +631,7 @@ def chart_weekly(df: pd.DataFrame):
 
     fig.suptitle("Weekly Patterns", fontsize=12, fontweight="bold")
     fig.tight_layout()
-    _save(fig, "corr_weekly.png")
+    gc.save_fig(fig, "corr_weekly.png")
 
 
 def chart_interesting_days(df: pd.DataFrame, interesting: list):
@@ -673,9 +666,9 @@ def chart_interesting_days(df: pd.DataFrame, interesting: list):
 
     ax.set_ylabel("Sleep Score", color=SLEEP_SCORE_COLOR)
     ax.set_title("Sleep Score Timeline with Notable Days", fontsize=12)
-    _fmt_date(ax)
+    gc.fmt_date_axis(ax)
     fig.tight_layout()
-    _save(fig, "corr_interesting_days.png")
+    gc.save_fig(fig, "corr_interesting_days.png")
 
 
 def main():
@@ -688,10 +681,10 @@ def main():
     print("SLEEP & STRESS CORRELATION ANALYZER")
     print("=" * 70 + "\n")
 
-    conn = db_connect()
+    conn = gc.connect_db()
 
     print("Loading data from database…")
-    data, _ = load_raw_data(conn, days_limit=args.days)
+    data = load_raw_data(conn, days_limit=args.days)
     print(f"  Sleep: {len(data['sleep'])} nights")
     print(f"  Daily: {len(data['daily'])} days")
     print(f"  HRV: {len(data['hrv'])} days")
@@ -711,13 +704,14 @@ def main():
 
     print("\nComputing correlations…")
     corrs = compute_correlations(df)
-    print(f"  Found {len(corrs)} significant correlations")
+    sig = sum(1 for c in corrs.values() if c.p < 0.05)
+    print(f"  Computed {len(corrs)} correlations ({sig} significant at p<0.05)")
 
     print("\nAnalyzing weekly patterns…")
     dow_patterns = compute_weekly_patterns(df)
 
     print("\nDetecting interesting days…")
-    interesting = detect_interesting_days(df, corrs)
+    interesting = detect_interesting_days(df)
     print(f"  Found {len(interesting)} interesting day patterns")
 
     print("\nGenerating report…")
