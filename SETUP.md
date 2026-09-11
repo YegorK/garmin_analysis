@@ -39,7 +39,15 @@ You should see `Python 3.12.x`. If you get "not recognised", restart PowerShell 
 
 ## Step 3 — Get the scripts
 
-Copy the script files Yegor sent you (`garmin_analysis.py`, `tennis_analysis.py`, `sleep_stress_analysis.py`) into a folder. For example, create a folder on your Desktop:
+Copy the script files Yegor sent you into a folder — **all five, in the same folder**:
+
+- `garmin_common.py` — shared code the others need; nothing runs without it
+- `garmin_analysis.py`
+- `tennis_analysis.py`
+- `cycling_analysis.py`
+- `sleep_stress_analysis.py`
+
+For example, create a folder on your Desktop:
 
 ```powershell
 mkdir "$env:USERPROFILE\Desktop\garmin_analysis"
@@ -149,8 +157,17 @@ python tennis_analysis.py
 # Tennis analysis — summary only, no charts
 python tennis_analysis.py --no-charts
 
+# Cycling analysis — full with charts
+python cycling_analysis.py
+
+# Cycling analysis — summary only, no charts
+python cycling_analysis.py --no-charts
+
 # Sleep and stress correlation analysis
 python sleep_stress_analysis.py
+
+# Sleep and stress — limit to the last 30 days
+python sleep_stress_analysis.py --days 30
 ```
 
 ---
@@ -167,6 +184,9 @@ All output files are in the `garmin_output\` folder (inside your scripts folder)
 | `intraday_sample.png` | Last 7 days of intraday signals |
 | `tennis_progression.png` | Heart rate, distance, calories across sessions |
 | `tennis_efficiency.png` | Fitness trends per tennis session |
+| `cycling_progression.png` | Heart rate, speed, calories across rides |
+| `cycling_efficiency.png` | Fitness trends per cycling ride |
+| `corr_*.png` | Sleep/stress correlation charts |
 | `sleep_stress_report.txt` | Written correlation analysis report |
 
 ---
@@ -181,6 +201,9 @@ Run this in PowerShell and try again:
 ```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
+
+**"garmin_common.py not found"**
+That file holds code the other scripts share. Copy it into the same folder as the rest of the scripts and try again.
 
 **"No module named pandas" or similar**
 Make sure the virtual environment is active — your prompt should show `(.venv)`. If not, run:
